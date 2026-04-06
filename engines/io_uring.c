@@ -25,6 +25,8 @@
 #include "cmdprio.h"
 #include "zbd.h"
 #include "nvme.h"
+#include <linux/dma-buf.h>
+#include <linux/udmabuf.h>
 
 #include <sys/stat.h>
 
@@ -165,6 +167,15 @@ struct ioring_data {
 	bool is_uring_cmd_eng;
 
 	struct nvme_cmd_ext_io_opts ext_opts;
+
+	struct buf_udma *dmabuf;
+};
+
+struct buf_udma {
+        void *ptr;
+	size_t size;
+	int dmabuf_fd;
+	int memfd;
 };
 
 struct ioring_options {
@@ -192,6 +203,7 @@ struct ioring_options {
 	unsigned int prchk;
 	char *pi_chk;
 	enum uring_cmd_type cmd_type;
+	unsigned int dmabuf;
 };
 
 static unsigned int enter_flags = IORING_ENTER_GETEVENTS;
@@ -444,6 +456,15 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_IOURING,
 	},
 	{
+		.name	= "dmabuf",
+		.lname	= "Pre-mapped dma buffers",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct ioring_options, dmabuf),
+		.help	= "Pre map dma IO buffers",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
 		.name	= NULL,
 	},
 };
@@ -463,6 +484,65 @@ static int io_uring_enter(struct ioring_data *ld, unsigned int to_submit,
 #ifndef BLOCK_URING_CMD_DISCARD
 #define BLOCK_URING_CMD_DISCARD	_IO(0x12, 0)
 #endif
+
+static int create_udmabuf(struct buf_udma *b, size_t size)
+{
+	struct udmabuf_create create;
+	int memfd, dmabuf_fd = 0;
+	void *p;
+	int ret, devfd;
+
+	devfd = open("/dev/udmabuf", O_RDWR);
+	if (devfd < 0) {
+		printf("Failed to open udmabuf dev\n");
+		return devfd;
+	}
+       /*
+       * create_memory_backed_file - Create a memory-backed file in userspace
+       */
+       memfd = memfd_create("udmabuf-test", MFD_ALLOW_SEALING);
+	if (memfd < 0) {
+		printf("Failed to create memfd: %d\n", memfd);
+		return memfd;
+	}
+
+	ret = fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK);
+	if (ret < 0) {
+		printf("Failed to set seals\n");
+		return ret;
+	}
+
+	ret = ftruncate(memfd, size);
+	if (ret == -1) {
+		printf("Failed to resize udmabuf\n");
+		return ret;
+	}
+
+	memset(&create, 0, sizeof(create));
+	create.memfd = memfd;
+	create.offset = 0;
+	create.size = size;
+	dmabuf_fd = ioctl(devfd, UDMABUF_CREATE, &create);
+	if (dmabuf_fd < 0) {
+		printf("Failed to create udmabuf(%d), size(%ld)\n", dmabuf_fd, size);
+		return dmabuf_fd;
+	}
+
+	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			memfd, 0);
+	if (p == MAP_FAILED) {
+		printf("Failed to mmap udmabuf\n");
+		return -1;
+	}
+
+	close(devfd);
+	b->size = size;
+	b->dmabuf_fd = dmabuf_fd;
+	b->memfd = memfd;
+	b->ptr = p;
+        printf("Created udmabuf with dmabuf_fd=%d, memfd=%d, size=%ld\n", dmabuf_fd, memfd, size);
+	return 0;
+}
 
 static void fio_ioring_prep_md(struct thread_data *td, struct io_u *io_u)
 {
@@ -504,6 +584,12 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 		if (o->fixedbufs) {
 			sqe->opcode = fixed_ddir_to_op[io_u->ddir];
 			sqe->addr = (unsigned long) io_u->xfer_buf;
+			sqe->len = io_u->xfer_buflen;
+			sqe->buf_index = io_u->index;
+		} else if (o->dmabuf) {
+                        sqe->opcode = fixed_ddir_to_op[io_u->ddir];
+			sqe->addr = (unsigned long)((char *)ld->dmabuf->ptr +
+						 (size_t)io_u->index * td_max_bs(td));
 			sqe->len = io_u->xfer_buflen;
 			sqe->buf_index = io_u->index;
 		} else {
@@ -626,11 +712,10 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 		ld->prepped = 0;
 		sqe->flags |= IOSQE_ASYNC;
 	}
-	if (o->fixedbufs) {
+	if (o->fixedbufs || o->dmabuf) {
 		sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
 		sqe->buf_index = io_u->index;
 	}
-
 	cmd = (struct nvme_uring_cmd *)sqe->cmd;
 	dsm_size = sizeof(*ld->dsm) + td->o.num_range * sizeof(struct nvme_dsm_range);
 	ptr += io_u->index * dsm_size;
@@ -1039,6 +1124,16 @@ static void fio_ioring_cleanup(struct thread_data *td)
 		free(ld->iovecs);
 		free(ld->fds);
 		free(ld->dsm);
+
+		if (ld->dmabuf) {
+			if (ld->dmabuf->ptr && ld->dmabuf->dmabuf_fd > 0)
+				munmap(ld->dmabuf->ptr, ld->dmabuf->size);
+			if (ld->dmabuf->dmabuf_fd > 0)
+				close(ld->dmabuf->dmabuf_fd);
+			if (ld->dmabuf->memfd > 0)
+				close(ld->dmabuf->memfd);
+			free(ld->dmabuf);
+		}
 		free(ld);
 	}
 }
@@ -1196,7 +1291,7 @@ retry:
 
 	fio_ioring_probe(td);
 
-	if (o->fixedbufs) {
+	if (o->fixedbufs || o->dmabuf) {
 		ret = syscall(__NR_io_uring_register, ld->ring_fd,
 				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
 		if (ret < 0)
@@ -1336,13 +1431,36 @@ static int fio_ioring_post_init(struct thread_data *td)
 	struct ioring_options *o = td->eo;
 	struct io_u *io_u;
 	int err, i;
+	size_t block_size = td_max_bs(td);
+
+	/*
+	 * If dmabuf is enabled, create the dmabuf and point the iov_base to
+	 * the right offset in the dmabuf for each ld->io_u_index[i].
+	 */
+	if (o->dmabuf) {
+		ld->dmabuf = calloc(1, sizeof(*ld->dmabuf));
+		if (!ld->dmabuf) {
+			printf("Failed to allocate dmabuf structure\n");
+			return 1;
+		}
+		err = create_udmabuf(ld->dmabuf, block_size * roundup_pow2(td->o.iodepth));
+		if (err < 0 ){
+			printf("create_udmabuf failed: %d\n", err);
+			free(ld->dmabuf);
+			ld->dmabuf = NULL;
+			return 1;
+		}
+	}
 
 	for (i = 0; i < td->o.iodepth; i++) {
 		struct iovec *iov = &ld->iovecs[i];
 
 		io_u = ld->io_u_index[i];
-		iov->iov_base = io_u->buf;
-		iov->iov_len = td_max_bs(td);
+		if (o->dmabuf)
+		      iov->iov_base = ld->dmabuf->ptr + i * block_size;
+		else
+		      iov->iov_base = io_u->buf;
+		iov->iov_len = block_size;
 	}
 
 	err = fio_ioring_queue_init(td);
