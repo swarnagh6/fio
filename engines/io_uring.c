@@ -25,6 +25,7 @@
 #include "cmdprio.h"
 #include "zbd.h"
 #include "nvme.h"
+#include <linux/udmabuf.h>
 
 #include <sys/stat.h>
 
@@ -45,6 +46,22 @@
 #define LBMD_PI_CSUM_IP			1
 #define LBMD_PI_CSUM_CRC16_T10DIF	2
 #define LBMD_PI_CSUM_CRC64_NVME		4
+
+#ifndef IORING_RSRC_REGISTER_SPARSE
+#define IORING_RSRC_REGISTER_SPARSE    (1U << 0)
+#endif /* IORING_RSRC_REGISTER_SPARSE */
+
+#ifndef IORING_RSRC_UPDATE_EXTENDED
+#define IORING_RSRC_UPDATE_EXTENDED   (1U << 1)
+#endif
+
+#ifndef IO_REGBUF_TYPE_DMABUF
+enum io_uring_regbuf_type {
+	IO_REGBUF_TYPE_EMPTY,
+	IO_REGBUF_TYPE_UADDR,
+	IO_REGBUF_TYPE_DMABUF,
+};
+#endif
 
 /*
  * Logical block metadata capability descriptor
@@ -165,7 +182,30 @@ struct ioring_data {
 	bool is_uring_cmd_eng;
 
 	struct nvme_cmd_ext_io_opts ext_opts;
+
+	struct buf_udma *dmabuf;
 };
+
+struct buf_udma {
+        void *ptr;
+	size_t size;
+	int dmabuf_fd;
+	int memfd;
+	int target_fd;
+};
+
+#ifndef IORING_REGBUF_DESC_DEFINED
+#define IORING_REGBUF_DESC_DEFINED
+struct io_uring_regbuf_desc {
+	__u32 type;
+	__u32 flags;
+	__u64 size;
+	__u64 uaddr;
+	__s32 dmabuf_fd;
+	__s32 target_fd;
+	__u64 __resv[6];
+};
+#endif
 
 struct ioring_options {
 	struct thread_data *td;
@@ -192,9 +232,11 @@ struct ioring_options {
 	unsigned int prchk;
 	char *pi_chk;
 	enum uring_cmd_type cmd_type;
+	unsigned int dmabuf;
 };
 
 static unsigned int enter_flags = IORING_ENTER_GETEVENTS;
+static int fio_ioring_open_file(struct thread_data *td, struct fio_file *f);
 
 static const int ddir_to_op[2][2] = {
 	{ IORING_OP_READV, IORING_OP_READ },
@@ -444,6 +486,15 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_IOURING,
 	},
 	{
+		.name	= "dmabuf",
+		.lname	= "Pre-mapped dma buffers",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct ioring_options, dmabuf),
+		.help	= "Pre map dma IO buffers",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
 		.name	= NULL,
 	},
 };
@@ -463,6 +514,222 @@ static int io_uring_enter(struct ioring_data *ld, unsigned int to_submit,
 #ifndef BLOCK_URING_CMD_DISCARD
 #define BLOCK_URING_CMD_DISCARD	_IO(0x12, 0)
 #endif
+
+static int create_udmabuf(struct buf_udma *b, size_t size)
+{
+	struct udmabuf_create create;
+	int memfd = -1, dmabuf_fd = -1, devfd = -1;
+	void *p;
+
+	/*
+	 * ensure that udmabuf is PAGE ALIGNED
+	 */
+	size = (size + page_mask) & ~page_mask;
+
+	devfd = open("/dev/udmabuf", O_RDWR);
+	if (devfd < 0) {
+		log_err("fio: failed to open /dev/udmabuf: %s\n",
+			strerror(errno));
+		return -1;
+	}
+
+	/*
+	 * The dmabuf is backed by a memfd, which has to be sealed against
+	 * shrinking before udmabuf will accept it.
+	 */
+	memfd = memfd_create("fio-udmabuf", MFD_ALLOW_SEALING);
+	if (memfd < 0) {
+		log_err("fio: memfd_create failed: %s\n", strerror(errno));
+		goto err;
+	}
+
+	if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) {
+		log_err("fio: failed to seal memfd: %s\n", strerror(errno));
+		goto err;
+	}
+
+	if (ftruncate(memfd, size) < 0) {
+		log_err("fio: failed to size memfd to %llu bytes: %s\n",
+			(unsigned long long) size, strerror(errno));
+		goto err;
+	}
+
+	memset(&create, 0, sizeof(create));
+	create.memfd = memfd;
+	create.offset = 0;
+	create.size = size;
+	dmabuf_fd = ioctl(devfd, UDMABUF_CREATE, &create);
+	if (dmabuf_fd < 0) {
+		log_err("fio: UDMABUF_CREATE (size %llu) failed: %s\n",
+			(unsigned long long) size, strerror(errno));
+		goto err;
+	}
+
+	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+	if (p == MAP_FAILED) {
+		log_err("fio: failed to mmap udmabuf: %s\n", strerror(errno));
+		goto err;
+	}
+
+	close(devfd);
+	b->size = size;
+	b->dmabuf_fd = dmabuf_fd;
+	b->memfd = memfd;
+	b->ptr = p;
+	dprint(FD_MEM, "udmabuf dmabuf_fd=%d memfd=%d size=%llu ptr=%p\n",
+	       dmabuf_fd, memfd, (unsigned long long) size, p);
+	return 0;
+err:
+	if (dmabuf_fd >= 0)
+		close(dmabuf_fd);
+	if (memfd >= 0)
+		close(memfd);
+	close(devfd);
+	return -1;
+}
+
+/*
+ * iomem hooks. When dmabuf=1, back td->orig_buffer with a udmabuf region
+ * so io_u buffers carved out of it can be registered with io_uring as
+ * dmabuf-backed fixed buffers. If dmabuf=0, fall through to plain malloc.
+ */
+static int fio_ioring_iomem_alloc(struct thread_data *td, size_t total_mem)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+
+	if (!o->dmabuf) {
+		td->orig_buffer = malloc(total_mem);
+		dprint(FD_MEM, "iouring malloc %llu %p\n",
+		       (unsigned long long) total_mem, td->orig_buffer);
+		return td->orig_buffer == NULL;
+	}
+
+	ld->dmabuf = calloc(1, sizeof(*ld->dmabuf));
+	if (!ld->dmabuf) {
+		log_err("fio: failed to allocate dmabuf state\n");
+		return 1;
+	}
+	ld->dmabuf->dmabuf_fd = -1;
+	ld->dmabuf->memfd = -1;
+	ld->dmabuf->target_fd = -1;
+
+	if (create_udmabuf(ld->dmabuf, total_mem) < 0) {
+		free(ld->dmabuf);
+		ld->dmabuf = NULL;
+		return 1;
+	}
+
+	td->orig_buffer = ld->dmabuf->ptr;
+	dprint(FD_MEM, "iouring dmabuf %llu %p\n",
+	       (unsigned long long) total_mem, td->orig_buffer);
+	return 0;
+}
+
+static void fio_ioring_iomem_free(struct thread_data *td)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+
+	if (!o->dmabuf) {
+		free(td->orig_buffer);
+		td->orig_buffer = NULL;
+		return;
+	}
+
+	if (ld && ld->dmabuf) {
+		if (ld->dmabuf->ptr)
+			munmap(ld->dmabuf->ptr, ld->dmabuf->size);
+		if (ld->dmabuf->dmabuf_fd >= 0)
+			close(ld->dmabuf->dmabuf_fd);
+		if (ld->dmabuf->memfd >= 0)
+			close(ld->dmabuf->memfd);
+		if (ld->dmabuf->target_fd >= 0)
+			close(ld->dmabuf->target_fd);
+		free(ld->dmabuf);
+		ld->dmabuf = NULL;
+	}
+	td->orig_buffer = NULL;
+}
+
+static int fio_ioring_register_dmabuf_buffers(struct thread_data *td,
+					      struct ioring_data *ld, int depth)
+{
+	struct io_uring_rsrc_register reg = {
+		.nr = depth,
+		.resv = IORING_RSRC_REGISTER_SPARSE,
+	};
+	struct io_uring_regbuf_desc *rbs;
+	struct io_uring_rsrc_update2 up;
+	struct fio_file *f = td->files[0];
+	int i, ret, nr = td->o.iodepth;
+	bool opened = false;
+
+	ret = syscall(__NR_io_uring_register, ld->ring_fd,
+		IORING_REGISTER_BUFFERS2, &reg, sizeof(reg));
+	if (ret < 0) {
+		log_err("fio: failed to register %d sparse buffers: %s\n",
+			depth, strerror(errno));
+		return ret;
+	}
+
+	rbs = calloc(nr, sizeof(*rbs));
+	if (!rbs)
+		return -1;
+
+	/*
+	 * The buffers are attached to the device that will DMA to/from them,
+	 * so registration needs the target fd.
+	 */
+	if (f->fd == -1) {
+		if (generic_open_file(td, f)) {
+			log_err("fio: failed to open %s for dmabuf buffer "
+				"registration\n", f->file_name);
+			free(rbs);
+			return -1;
+		}
+		opened = true;
+	}
+
+	for (i = 0; i < nr; i++) {
+		rbs[i].type = IO_REGBUF_TYPE_DMABUF;
+		/* uaddr and size must be zero for IO_REGBUF_TYPE_DMABUF */
+		rbs[i].dmabuf_fd = ld->dmabuf->dmabuf_fd;
+		rbs[i].target_fd = f->fd;
+		dprint(FD_IO, "iouring dmabuf reg[%d] tfd=%d dfd=%d\n",
+		       i, rbs[i].target_fd, rbs[i].dmabuf_fd);
+	}
+
+	memset(&up, 0, sizeof(up));
+	up.flags = IORING_RSRC_UPDATE_EXTENDED;
+	up.data = (unsigned long long)(uintptr_t) rbs;
+	up.nr = nr;
+
+	ret = syscall(__NR_io_uring_register, ld->ring_fd,
+		IORING_REGISTER_BUFFERS_UPDATE, &up, sizeof(up));
+	if (ret < 0)
+		log_err("fio: dmabuf fixed buffer update failed: %s\n",
+			strerror(errno));
+
+	free(rbs);
+
+	if (ret < 0) {
+		if (opened) {
+			int fio_unused ret2;
+			ret2 = generic_close_file(td, f);
+		}
+		return ret;
+	}
+
+	/*
+	 * store the file descriptor so that it can be read from
+	 * fio_ioring_open_file correctly.
+	 */
+	ld->dmabuf->target_fd = f->fd;
+	if (opened)
+		f->fd = -1;
+	return 0;
+}
 
 static void fio_ioring_prep_md(struct thread_data *td, struct io_u *io_u)
 {
@@ -501,9 +768,14 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {
-		if (o->fixedbufs) {
+		if (o->fixedbufs || o->dmabuf) {
 			sqe->opcode = fixed_ddir_to_op[io_u->ddir];
-			sqe->addr = (unsigned long) io_u->xfer_buf;
+			/* dmabuf addr is offset within the registered dmabuf, not a uptr */
+			if (o->dmabuf)
+				sqe->addr = (unsigned long)io_u->xfer_buf -
+					    (unsigned long)td->orig_buffer;
+			else
+				sqe->addr = (unsigned long) io_u->xfer_buf;
 			sqe->len = io_u->xfer_buflen;
 			sqe->buf_index = io_u->index;
 		} else {
@@ -626,7 +898,7 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 		ld->prepped = 0;
 		sqe->flags |= IOSQE_ASYNC;
 	}
-	if (o->fixedbufs) {
+	if (o->fixedbufs || o->dmabuf) {
 		sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
 		sqe->buf_index = io_u->index;
 	}
@@ -1039,6 +1311,7 @@ static void fio_ioring_cleanup(struct thread_data *td)
 		free(ld->iovecs);
 		free(ld->fds);
 		free(ld->dsm);
+		/* ld->dmabuf is released by fio_ioring_iomem_free() */
 		free(ld);
 	}
 }
@@ -1201,6 +1474,10 @@ retry:
 				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
 		if (ret < 0)
 			return ret;
+	} else if (o->dmabuf) {
+		ret = fio_ioring_register_dmabuf_buffers(td, ld, depth);
+		if (ret < 0)
+			return ret;
 	}
 
 	return fio_ioring_mmap(ld, &p);
@@ -1283,6 +1560,10 @@ retry:
 	if (o->fixedbufs) {
 		ret = syscall(__NR_io_uring_register, ld->ring_fd,
 				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
+		if (ret < 0)
+			return ret;
+	} else if (o->dmabuf) {
+		ret = fio_ioring_register_dmabuf_buffers(td, ld, depth);
 		if (ret < 0)
 			return ret;
 	}
@@ -1482,6 +1763,29 @@ static int fio_ioring_init(struct thread_data *td)
 		log_err("fio: io_uring registered files require nr_files to "
 			"be identical to open_files\n");
 		return 1;
+	}
+
+	if (o->dmabuf) {
+		/*
+		 * Both register the fixed buffer table, and dmabuf needs to
+		 * own the IO buffer allocation so that the io_u buffers fio
+		 * fills and verifies are the ones the device DMAs to/from.
+		 */
+		if (o->fixedbufs) {
+			log_err("fio: dmabuf and fixedbufs are mutually "
+				"exclusive\n");
+			return 1;
+		}
+		if (fio_option_is_set(&td->o, mem_type)) {
+			log_err("fio: dmabuf cannot be combined with "
+				"mem/iomem\n");
+			return 1;
+		}
+		/* the buffers are attached to a single target device */
+		if (td->o.nr_files != 1) {
+			log_err("fio: dmabuf requires exactly one file\n");
+			return 1;
+		}
 	}
 
 	ld = calloc(1, sizeof(*ld));
@@ -1727,6 +2031,11 @@ static int fio_ioring_open_file(struct thread_data *td, struct fio_file *f)
 			return ret;
 	}
 
+	if (ld && o->dmabuf) {
+		f->fd = ld->dmabuf->target_fd;
+		return 0;
+	}
+
 	if (!ld || !o->registerfiles)
 		return generic_open_file(td, f);
 
@@ -1839,8 +2148,14 @@ static int fio_ioring_close_file(struct thread_data *td, struct fio_file *f)
 	struct ioring_data *ld = td->io_ops_data;
 	struct ioring_options *o = td->eo;
 
-	if (!ld || !o->registerfiles)
+	if (!ld || !o->registerfiles) {
+		if (ld && o->dmabuf) {
+			/* actual close deferred to iomem_free to keep target_file alive */
+			f->fd = -1;
+			return 0;
+		}
 		return generic_close_file(td, f);
+	}
 
 	f->fd = -1;
 	return 0;
@@ -1991,9 +2306,11 @@ static struct ioengine_ops ioengine_uring = {
 	.name			= "io_uring",
 	.version		= FIO_IOOPS_VERSION,
 	.flags			= FIO_NO_OFFLOAD | FIO_ASYNCIO_SETS_ISSUE_TIME |
-				  FIO_ATOMICWRITES,
+				  FIO_ATOMICWRITES | FIO_SKIPPABLE_IOMEM_ALLOC,
 	.init			= fio_ioring_init,
 	.post_init		= fio_ioring_post_init,
+	.iomem_alloc		= fio_ioring_iomem_alloc,
+	.iomem_free		= fio_ioring_iomem_free,
 	.io_u_init		= fio_ioring_io_u_init,
 	.io_u_free		= fio_ioring_io_u_free,
 	.prep			= fio_ioring_prep,
@@ -2021,9 +2338,12 @@ static struct ioengine_ops ioengine_uring_cmd = {
 	.flags			= FIO_NO_OFFLOAD | FIO_MEMALIGN | FIO_RAWIO |
 					FIO_ASYNCIO_SETS_ISSUE_TIME |
 					FIO_MULTI_RANGE_TRIM |
-					FIO_ASYNCIO_SYNC_SYNCFS,
+					FIO_ASYNCIO_SYNC_SYNCFS |
+					FIO_SKIPPABLE_IOMEM_ALLOC,
 	.init			= fio_ioring_init,
 	.post_init		= fio_ioring_cmd_post_init,
+	.iomem_alloc		= fio_ioring_iomem_alloc,
+	.iomem_free		= fio_ioring_iomem_free,
 	.io_u_init		= fio_ioring_io_u_init,
 	.io_u_free		= fio_ioring_io_u_free,
 	.prep			= fio_ioring_cmd_prep,
