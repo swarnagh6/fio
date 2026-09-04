@@ -541,4 +541,23 @@ struct io_uring_getevents_arg {
 	__u64	ts;
 };
 
+#define IORING_RSRC_REGISTER_SPARSE    (1U << 0)
+#define IORING_RSRC_UPDATE_EXTENDED   (1U << 1)
+
+enum io_uring_regbuf_type {
+	IO_REGBUF_TYPE_EMPTY,
+	IO_REGBUF_TYPE_UADDR,
+	IO_REGBUF_TYPE_DMABUF,
+};
+
+struct io_uring_regbuf_desc {
+	__u32 type;
+	__u32 flags;
+	__u64 size;
+	__u64 uaddr;
+	__s32 dmabuf_fd;
+	__s32 target_fd;
+	__u64 __resv[6];
+};
+
 #endif
