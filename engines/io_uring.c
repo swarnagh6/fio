@@ -126,6 +126,16 @@ enum uring_cmd_verify_mode {
 	FIO_URING_CMD_VMODE_COMPARE,
 };
 
+/*
+ * dmabuf exporter backing the pre-mapped IO buffers. Only "udmabuf" is
+ * supported as of now, but can add support for GPU dmabuf exporters
+ * in the future.
+ */
+enum uring_dmabuf_type {
+	FIO_URING_DMABUF_NONE = 0,
+	FIO_URING_DMABUF_UDMABUF,
+};
+
 struct io_sq_ring {
 	unsigned *head;
 	unsigned *tail;
@@ -232,7 +242,7 @@ struct ioring_options {
 	unsigned int prchk;
 	char *pi_chk;
 	enum uring_cmd_type cmd_type;
-	unsigned int dmabuf;
+	enum uring_dmabuf_type dmabuf;
 };
 
 static unsigned int enter_flags = IORING_ENTER_GETEVENTS;
@@ -488,9 +498,20 @@ static struct fio_option options[] = {
 	{
 		.name	= "dmabuf",
 		.lname	= "Pre-mapped dma buffers",
-		.type	= FIO_OPT_STR_SET,
+		.type	= FIO_OPT_STR,
 		.off1	= offsetof(struct ioring_options, dmabuf),
-		.help	= "Pre map dma IO buffers",
+		.help	= "Back pre-mapped IO buffers with a dmabuf exporter",
+		.def	= "none",
+		.posval = {
+			  { .ival = "none",
+			    .oval = FIO_URING_DMABUF_NONE,
+			    .help = "Do not use dmabuf-backed buffers"
+			  },
+			  { .ival = "udmabuf",
+			    .oval = FIO_URING_DMABUF_UDMABUF,
+			    .help = "Use udmabuf-backed dmabuf buffers"
+			  },
+		},
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_IOURING,
 	},
@@ -589,16 +610,22 @@ err:
 }
 
 /*
- * iomem hooks. When dmabuf=1, back td->orig_buffer with a udmabuf region
- * so io_u buffers carved out of it can be registered with io_uring as
- * dmabuf-backed fixed buffers. If dmabuf=0, fall through to plain malloc.
+ * iomem hooks. When dmabuf=udmabuf, back td->orig_buffer with a udmabuf
+ * region so io_u buffers carved out of it can be registered with io_uring
+ * as dmabuf-backed fixed buffers. If dmabuf=none, fall through to plain
+ * malloc.
  */
 static int fio_ioring_iomem_alloc(struct thread_data *td, size_t total_mem)
 {
 	struct ioring_data *ld = td->io_ops_data;
 	struct ioring_options *o = td->eo;
 
-	if (!o->dmabuf) {
+	if (o->dmabuf == FIO_URING_DMABUF_NONE) {
+		if (td->o.mem_type != MEM_MALLOC) {
+			log_err("fio: io_uring engine only supports mem=malloc "
+				"when dmabuf is not in use\n");
+			return 1;
+		}
 		td->orig_buffer = malloc(total_mem);
 		dprint(FD_MEM, "iouring malloc %llu %p\n",
 		       (unsigned long long) total_mem, td->orig_buffer);
@@ -614,7 +641,16 @@ static int fio_ioring_iomem_alloc(struct thread_data *td, size_t total_mem)
 	ld->dmabuf->memfd = -1;
 	ld->dmabuf->target_fd = -1;
 
-	if (create_udmabuf(ld->dmabuf, total_mem) < 0) {
+	switch (o->dmabuf) {
+	case FIO_URING_DMABUF_UDMABUF:
+		if (create_udmabuf(ld->dmabuf, total_mem) < 0) {
+			free(ld->dmabuf);
+			ld->dmabuf = NULL;
+			return 1;
+		}
+		break;
+	default:
+		log_err("fio: unsupported dmabuf exporter\n");
 		free(ld->dmabuf);
 		ld->dmabuf = NULL;
 		return 1;
@@ -631,7 +667,7 @@ static void fio_ioring_iomem_free(struct thread_data *td)
 	struct ioring_data *ld = td->io_ops_data;
 	struct ioring_options *o = td->eo;
 
-	if (!o->dmabuf) {
+	if (o->dmabuf == FIO_URING_DMABUF_NONE) {
 		free(td->orig_buffer);
 		td->orig_buffer = NULL;
 		return;
@@ -768,10 +804,10 @@ static int fio_ioring_prep(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {
-		if (o->fixedbufs || o->dmabuf) {
+		if (o->fixedbufs || o->dmabuf != FIO_URING_DMABUF_NONE) {
 			sqe->opcode = fixed_ddir_to_op[io_u->ddir];
 			/* dmabuf addr is offset within the registered dmabuf, not a uptr */
-			if (o->dmabuf)
+			if (o->dmabuf != FIO_URING_DMABUF_NONE)
 				sqe->addr = (unsigned long)io_u->xfer_buf -
 					    (unsigned long)td->orig_buffer;
 			else
@@ -898,7 +934,7 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 		ld->prepped = 0;
 		sqe->flags |= IOSQE_ASYNC;
 	}
-	if (o->fixedbufs || o->dmabuf) {
+	if (o->fixedbufs || o->dmabuf != FIO_URING_DMABUF_NONE) {
 		sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
 		sqe->buf_index = io_u->index;
 	}
@@ -1474,7 +1510,7 @@ retry:
 				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
 		if (ret < 0)
 			return ret;
-	} else if (o->dmabuf) {
+	} else if (o->dmabuf != FIO_URING_DMABUF_NONE) {
 		ret = fio_ioring_register_dmabuf_buffers(td, ld, depth);
 		if (ret < 0)
 			return ret;
@@ -1562,7 +1598,7 @@ retry:
 				IORING_REGISTER_BUFFERS, ld->iovecs, depth);
 		if (ret < 0)
 			return ret;
-	} else if (o->dmabuf) {
+	} else if (o->dmabuf != FIO_URING_DMABUF_NONE) {
 		ret = fio_ioring_register_dmabuf_buffers(td, ld, depth);
 		if (ret < 0)
 			return ret;
@@ -1765,7 +1801,7 @@ static int fio_ioring_init(struct thread_data *td)
 		return 1;
 	}
 
-	if (o->dmabuf) {
+	if (o->dmabuf != FIO_URING_DMABUF_NONE) {
 		/*
 		 * Both register the fixed buffer table, and dmabuf needs to
 		 * own the IO buffer allocation so that the io_u buffers fio
@@ -2031,7 +2067,15 @@ static int fio_ioring_open_file(struct thread_data *td, struct fio_file *f)
 			return ret;
 	}
 
-	if (ld && o->dmabuf) {
+	/*
+	 * cannot use the generic_open_file routine as it will open a different fd
+	 * that would fail, since for dmabuf path we bind the buffers to struct file
+	 * from the original fd used at registration time while issuing
+	 * IORING_REGISTER_BUFFER_UPDATE syscall. Hence use the real fd that was opened
+	 * once at registration time and therefore bypassing the standard file
+	 * handling routine is needed for correctness for this case.
+	 */
+	if (ld && o->dmabuf != FIO_URING_DMABUF_NONE) {
 		f->fd = ld->dmabuf->target_fd;
 		return 0;
 	}
@@ -2149,7 +2193,7 @@ static int fio_ioring_close_file(struct thread_data *td, struct fio_file *f)
 	struct ioring_options *o = td->eo;
 
 	if (!ld || !o->registerfiles) {
-		if (ld && o->dmabuf) {
+		if (ld && o->dmabuf != FIO_URING_DMABUF_NONE) {
 			/* actual close deferred to iomem_free to keep target_file alive */
 			f->fd = -1;
 			return 0;
